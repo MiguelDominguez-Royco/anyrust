@@ -43,6 +43,7 @@ struct HostSharedConfig {
     pub allow_input_control: AtomicBool,
     pub allow_clipboard: AtomicBool,
     pub active_clients: AtomicU32,
+    pub requested_scale_div: AtomicU32,
 }
 
 enum UiEvent {
@@ -217,7 +218,7 @@ async fn run_host_server(
     let bcast_tx_clone = frame_bcast_tx.clone();
     let cfg_capture = host_cfg.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(75));
+        let mut interval = tokio::time::interval(Duration::from_millis(60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
@@ -225,8 +226,9 @@ async fn run_host_server(
             if clients == 0 || !cfg_capture.allow_connections.load(Ordering::Relaxed) {
                 continue;
             }
+            let scale_div = cfg_capture.requested_scale_div.load(Ordering::Relaxed).clamp(1, 4);
             let frame_opt = tokio::task::spawn_blocking(move || {
-                let (w, h, rgba) = remote::win_io::capture_screen_rgba(2)?;
+                let (w, h, rgba) = remote::win_io::capture_screen_rgba(scale_div)?;
                 let compressed = compress_bytes(&rgba);
                 Some((w, h, compressed))
             })
@@ -277,11 +279,14 @@ async fn run_host_server(
                 pin,
                 totp_code,
                 client_name,
-                scale_div: _,
+                scale_div,
             }) = read_packet(&mut stream).await
             else {
                 return;
             };
+
+            let initial_div = scale_div.clamp(1, 4);
+            cfg_clone.requested_scale_div.store(initial_div, Ordering::Relaxed);
 
             let expected_pin = cfg_clone.pin.lock().unwrap().clone();
             if pin.trim() != expected_pin.trim() {
@@ -431,6 +436,10 @@ async fn run_host_server(
                                 }
                             }
                         }
+                        NetPacket::SetQuality { scale_div } => {
+                            let div = scale_div.clamp(1, 4);
+                            cfg_for_reader.requested_scale_div.store(div, Ordering::Relaxed);
+                        }
                         _ => {}
                     }
                 }
@@ -465,6 +474,10 @@ pub struct AnyRustApp {
     target_pin_input: String,
     target_2fa_input: String,
     scale_div: u32,
+    auto_quality: bool,
+    last_auto_quality_eval: Instant,
+    low_fps_counter: u32,
+    high_fps_counter: u32,
     is_connecting: bool,
     is_connected: bool,
     remote_host_name: String,
@@ -513,6 +526,7 @@ impl AnyRustApp {
             allow_input_control: AtomicBool::new(true),
             allow_clipboard: AtomicBool::new(true),
             active_clients: AtomicU32::new(0),
+            requested_scale_div: AtomicU32::new(1),
         });
 
         let (ui_tx, ui_rx) = channel();
@@ -547,7 +561,11 @@ impl AnyRustApp {
             target_address_input: "127.0.0.1".to_string(),
             target_pin_input: "1234".to_string(),
             target_2fa_input: String::new(),
-            scale_div: 2,
+            scale_div: 1,
+            auto_quality: true,
+            last_auto_quality_eval: Instant::now(),
+            low_fps_counter: 0,
+            high_fps_counter: 0,
             is_connecting: false,
             is_connected: false,
             remote_host_name: String::new(),
@@ -797,6 +815,7 @@ impl AnyRustApp {
                                 }
                             }
                         }
+                        // En el cliente receptor no procesamos SetQuality (solo el host lo procesa)
                         _ => {}
                     }
                 }
@@ -882,19 +901,45 @@ impl AnyRustApp {
 
             ui.separator();
             ui.label("Calidad:");
+            let prev_auto = self.auto_quality;
             let prev_scale = self.scale_div;
+
+            let quality_label = if self.auto_quality {
+                match self.scale_div {
+                    1 => "🤖 Auto: HD (100%)",
+                    2 => "🤖 Auto: Equilibrada (50%)",
+                    _ => "🤖 Auto: Rápida (33%)",
+                }
+            } else {
+                match self.scale_div {
+                    1 => "💎 Forzar HD (100%)",
+                    2 => "⚖ Forzar Equilibrada (50%)",
+                    _ => "⚡ Forzar Rápida (33%)",
+                }
+            };
+
             egui::ComboBox::from_id_salt("quality_combo_remote")
-                .selected_text(match self.scale_div {
-                    1 => "💎 HD (100%)",
-                    2 => "⚖ Equilibrada (50%)",
-                    _ => "⚡ Rápida (33%)",
-                })
+                .selected_text(quality_label)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.scale_div, 1, "💎 HD (100%)");
-                    ui.selectable_value(&mut self.scale_div, 2, "⚖ Equilibrada (50%)");
-                    ui.selectable_value(&mut self.scale_div, 3, "⚡ Rápida (33%)");
+                    if ui.selectable_label(self.auto_quality, "🤖 Automático (Según conexión)").clicked() {
+                        self.auto_quality = true;
+                    }
+                    ui.separator();
+                    if ui.selectable_label(!self.auto_quality && self.scale_div == 1, "💎 Forzar HD (100% Sin comprimir)").clicked() {
+                        self.auto_quality = false;
+                        self.scale_div = 1;
+                    }
+                    if ui.selectable_label(!self.auto_quality && self.scale_div == 2, "⚖ Forzar Equilibrada (50%)").clicked() {
+                        self.auto_quality = false;
+                        self.scale_div = 2;
+                    }
+                    if ui.selectable_label(!self.auto_quality && self.scale_div == 3, "⚡ Forzar Rápida (33%)").clicked() {
+                        self.auto_quality = false;
+                        self.scale_div = 3;
+                    }
                 });
-            if prev_scale != self.scale_div {
+
+            if prev_scale != self.scale_div || prev_auto != self.auto_quality {
                 if let Some(tx) = &self.client_out_tx {
                     let _ = tx.send(NetPacket::SetQuality {
                         scale_div: self.scale_div,
@@ -1218,6 +1263,43 @@ impl eframe::App for AnyRustApp {
                                 color_img,
                                 egui::TextureOptions::LINEAR,
                             ));
+                        }
+                    }
+
+                    // Evaluación de Calidad Automática Adaptativa (según FPS y fluidez de red)
+                    if self.auto_quality && self.last_auto_quality_eval.elapsed() > Duration::from_secs(2) {
+                        self.last_auto_quality_eval = Instant::now();
+                        let mut quality_changed = false;
+
+                        if self.fps < 10.0 {
+                            self.low_fps_counter += 1;
+                            self.high_fps_counter = 0;
+                            // Conexión saturada o con lag: bajar resolución para priorizar fluidez
+                            if self.low_fps_counter >= 2 && self.scale_div < 3 {
+                                self.scale_div += 1;
+                                self.low_fps_counter = 0;
+                                quality_changed = true;
+                            }
+                        } else if self.fps >= 14.0 {
+                            self.high_fps_counter += 1;
+                            self.low_fps_counter = 0;
+                            // Conexión excelente y fluida: subir resolución a HD
+                            if self.high_fps_counter >= 3 && self.scale_div > 1 {
+                                self.scale_div -= 1;
+                                self.high_fps_counter = 0;
+                                quality_changed = true;
+                            }
+                        } else {
+                            self.low_fps_counter = 0;
+                            self.high_fps_counter = 0;
+                        }
+
+                        if quality_changed {
+                            if let Some(tx) = &self.client_out_tx {
+                                let _ = tx.send(NetPacket::SetQuality {
+                                    scale_div: self.scale_div,
+                                });
+                            }
                         }
                     }
                 }
@@ -1600,23 +1682,45 @@ impl eframe::App for AnyRustApp {
                         .on_hover_text("Ingresa el código de 6 dígitos de Google o Microsoft Authenticator si el equipo remoto requiere 2FA");
 
                         ui.label("Calidad:");
+                        let prev_auto = self.auto_quality;
                         let prev_scale = self.scale_div;
+
+                        let quality_label = if self.auto_quality {
+                            match self.scale_div {
+                                1 => "🤖 Auto: HD (100%)",
+                                2 => "🤖 Auto: Equilibrada (50%)",
+                                _ => "🤖 Auto: Rápida (33%)",
+                            }
+                        } else {
+                            match self.scale_div {
+                                1 => "💎 Forzar HD (100%)",
+                                2 => "⚖ Forzar Equilibrada (50%)",
+                                _ => "⚡ Forzar Rápida (33%)",
+                            }
+                        };
+
                         egui::ComboBox::from_id_salt("quality_combo")
-                            .selected_text(match self.scale_div {
-                                1 => "💎 Alta HD (100%)",
-                                2 => "⚖ Equilibrada (50%)",
-                                _ => "⚡ Rápida (33%)",
-                            })
+                            .selected_text(quality_label)
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.scale_div, 1, "💎 Alta HD (100%)");
-                                ui.selectable_value(
-                                    &mut self.scale_div,
-                                    2,
-                                    "⚖ Equilibrada (50%)",
-                                );
-                                ui.selectable_value(&mut self.scale_div, 3, "⚡ Rápida (33%)");
+                                if ui.selectable_label(self.auto_quality, "🤖 Automático (Según conexión)").clicked() {
+                                    self.auto_quality = true;
+                                }
+                                ui.separator();
+                                if ui.selectable_label(!self.auto_quality && self.scale_div == 1, "💎 Forzar HD (100% Sin comprimir)").clicked() {
+                                    self.auto_quality = false;
+                                    self.scale_div = 1;
+                                }
+                                if ui.selectable_label(!self.auto_quality && self.scale_div == 2, "⚖ Forzar Equilibrada (50%)").clicked() {
+                                    self.auto_quality = false;
+                                    self.scale_div = 2;
+                                }
+                                if ui.selectable_label(!self.auto_quality && self.scale_div == 3, "⚡ Forzar Rápida (33%)").clicked() {
+                                    self.auto_quality = false;
+                                    self.scale_div = 3;
+                                }
                             });
-                        if prev_scale != self.scale_div {
+
+                        if prev_scale != self.scale_div || prev_auto != self.auto_quality {
                             if let Some(tx) = &self.client_out_tx {
                                 let _ = tx.send(NetPacket::SetQuality {
                                     scale_div: self.scale_div,
