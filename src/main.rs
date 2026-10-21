@@ -69,7 +69,10 @@ enum UiEvent {
 // [1 byte tipo: 1 = JSON NetPacket, 2 = VideoFrame binario]
 // [4 bytes longitud payload Big-Endian]
 // [payload]
-async fn write_packet(stream: &mut TcpStream, pkt: &NetPacket) -> std::io::Result<()> {
+async fn write_packet<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    pkt: &NetPacket,
+) -> std::io::Result<()> {
     match pkt {
         NetPacket::VideoFrame {
             width,
@@ -97,7 +100,7 @@ async fn write_packet(stream: &mut TcpStream, pkt: &NetPacket) -> std::io::Resul
     stream.flush().await
 }
 
-async fn read_packet(stream: &mut TcpStream) -> std::io::Result<NetPacket> {
+async fn read_packet<R: AsyncReadExt + Unpin>(stream: &mut R) -> std::io::Result<NetPacket> {
     let mut header = [0u8; 5];
     stream.read_exact(&mut header).await?;
     let kind = header[0];
@@ -243,67 +246,98 @@ async fn run_host_server(
             ctx_clone.request_repaint();
 
             let current_scale = Arc::new(AtomicU32::new(scale_div.clamp(1, 4)));
-            let mut interval = tokio::time::interval(Duration::from_millis(85));
+            let scale_for_writer = current_scale.clone();
+            let cfg_for_writer = cfg_clone.clone();
 
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if !cfg_clone.allow_connections.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let div = current_scale.load(Ordering::Relaxed);
-                        // Capturar y comprimir en hilo bloqueante para no frenar el runtime
-                        let frame_opt = tokio::task::spawn_blocking(move || {
-                            let (w, h, rgba) = remote::win_io::capture_screen_rgba(div)?;
-                            let compressed = compress_bytes(&rgba);
-                            Some((w, h, compressed))
-                        }).await.ok().flatten();
+            // Separar el socket TCP en mitad de lectura y mitad de escritura independientes
+            // para evitar que `tokio::select!` cancele `read_exact` a mitad de un paquete
+            let (mut reader, mut writer) = stream.into_split();
 
-                        if let Some((w, h, compressed_rgba)) = frame_opt {
-                            if write_packet(&mut stream, &NetPacket::VideoFrame {
+            let write_loop = async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(85));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    if !cfg_for_writer.allow_connections.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let div = scale_for_writer.load(Ordering::Relaxed);
+                    // Capturar y comprimir en hilo bloqueante para no frenar el runtime
+                    let frame_opt = tokio::task::spawn_blocking(move || {
+                        let (w, h, rgba) = remote::win_io::capture_screen_rgba(div)?;
+                        let compressed = compress_bytes(&rgba);
+                        Some((w, h, compressed))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+
+                    if let Some((w, h, compressed_rgba)) = frame_opt {
+                        if write_packet(
+                            &mut writer,
+                            &NetPacket::VideoFrame {
                                 width: w,
                                 height: h,
                                 compressed_rgba,
-                            }).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    pkt_res = read_packet(&mut stream) => {
-                        match pkt_res {
-                            Ok(NetPacket::MouseMove { norm_x, norm_y }) => {
-                                if cfg_clone.allow_input_control.load(Ordering::Relaxed) {
-                                    remote::win_io::inject_mouse_move(norm_x, norm_y);
-                                }
-                            }
-                            Ok(NetPacket::MouseClick { norm_x, norm_y, button, pressed }) => {
-                                if cfg_clone.allow_input_control.load(Ordering::Relaxed) {
-                                    remote::win_io::inject_mouse_click(norm_x, norm_y, button, pressed);
-                                }
-                            }
-                            Ok(NetPacket::KeyPress { vk }) => {
-                                if cfg_clone.allow_input_control.load(Ordering::Relaxed) {
-                                    remote::win_io::inject_key_press(vk);
-                                }
-                            }
-                            Ok(NetPacket::SetQuality { scale_div }) => {
-                                current_scale.store(scale_div.clamp(1, 4), Ordering::Relaxed);
-                            }
-                            Ok(NetPacket::ChatMessage { sender, text, time }) => {
-                                let _ = tx_clone.send(UiEvent::Chat { sender, text, time });
-                                ctx_clone.request_repaint();
-                            }
-                            Ok(NetPacket::ClipboardSync { text }) => {
-                                if cfg_clone.allow_clipboard.load(Ordering::Relaxed) {
-                                    let _ = tx_clone.send(UiEvent::RemoteClipboard(text));
-                                    ctx_clone.request_repaint();
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(_) => break,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
                         }
                     }
                 }
+            };
+
+            let cfg_for_reader = cfg_clone.clone();
+            let tx_for_reader = tx_clone.clone();
+            let ctx_for_reader = ctx_clone.clone();
+
+            let read_loop = async move {
+                while let Ok(pkt) = read_packet(&mut reader).await {
+                    match pkt {
+                        NetPacket::MouseMove { norm_x, norm_y } => {
+                            if cfg_for_reader.allow_input_control.load(Ordering::Relaxed) {
+                                remote::win_io::inject_mouse_move(norm_x, norm_y);
+                            }
+                        }
+                        NetPacket::MouseClick {
+                            norm_x,
+                            norm_y,
+                            button,
+                            pressed,
+                        } => {
+                            if cfg_for_reader.allow_input_control.load(Ordering::Relaxed) {
+                                remote::win_io::inject_mouse_click(norm_x, norm_y, button, pressed);
+                            }
+                        }
+                        NetPacket::KeyPress { vk } => {
+                            if cfg_for_reader.allow_input_control.load(Ordering::Relaxed) {
+                                remote::win_io::inject_key_press(vk);
+                            }
+                        }
+                        NetPacket::SetQuality { scale_div } => {
+                            current_scale.store(scale_div.clamp(1, 4), Ordering::Relaxed);
+                        }
+                        NetPacket::ChatMessage { sender, text, time } => {
+                            let _ = tx_for_reader.send(UiEvent::Chat { sender, text, time });
+                            ctx_for_reader.request_repaint();
+                        }
+                        NetPacket::ClipboardSync { text } => {
+                            if cfg_for_reader.allow_clipboard.load(Ordering::Relaxed) {
+                                let _ = tx_for_reader.send(UiEvent::RemoteClipboard(text));
+                                ctx_for_reader.request_repaint();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            };
+
+            tokio::select! {
+                _ = write_loop => {}
+                _ = read_loop => {}
             }
 
             cfg_clone.active_clients.fetch_sub(1, Ordering::Relaxed);
@@ -557,42 +591,58 @@ impl AnyRustApp {
                 }
             }
 
-            loop {
-                tokio::select! {
-                    Some(out_pkt) = out_rx.recv() => {
-                        if write_packet(&mut stream, &out_pkt).await.is_err() {
-                            break;
-                        }
-                    }
-                    in_res = read_packet(&mut stream) => {
-                        match in_res {
-                            Ok(NetPacket::VideoFrame { width, height, compressed_rgba }) => {
-                                let compressed_kb = compressed_rgba.len() / 1024;
-                                if let Some(rgba) = decompress_bytes(&compressed_rgba) {
-                                    if rgba.len() == (width as usize) * (height as usize) * 4 {
-                                        let _ = ui_tx.send(UiEvent::Frame {
-                                            width,
-                                            height,
-                                            rgba,
-                                            compressed_kb,
-                                        });
-                                        egui_ctx.request_repaint();
-                                    }
-                                }
-                            }
-                            Ok(NetPacket::ChatMessage { sender, text, time }) => {
-                                let _ = ui_tx.send(UiEvent::Chat { sender, text, time });
-                                egui_ctx.request_repaint();
-                            }
-                            Ok(NetPacket::ClipboardSync { text }) => {
-                                let _ = ui_tx.send(UiEvent::RemoteClipboard(text));
-                                egui_ctx.request_repaint();
-                            }
-                            Ok(_) => {}
-                            Err(_) => break,
-                        }
+            // Separar el socket TCP en mitad de lectura y mitad de escritura independientes
+            // para evitar que el envío de eventos de mouse/teclado cancele `read_exact` a mitad de un frame
+            let (mut reader, mut writer) = stream.into_split();
+
+            let write_loop = async move {
+                while let Some(out_pkt) = out_rx.recv().await {
+                    if write_packet(&mut writer, &out_pkt).await.is_err() {
+                        break;
                     }
                 }
+            };
+
+            let tx_for_reader = ui_tx.clone();
+            let ctx_for_reader = egui_ctx.clone();
+
+            let read_loop = async move {
+                while let Ok(in_pkt) = read_packet(&mut reader).await {
+                    match in_pkt {
+                        NetPacket::VideoFrame {
+                            width,
+                            height,
+                            compressed_rgba,
+                        } => {
+                            let compressed_kb = compressed_rgba.len() / 1024;
+                            if let Some(rgba) = decompress_bytes(&compressed_rgba) {
+                                if rgba.len() == (width as usize) * (height as usize) * 4 {
+                                    let _ = tx_for_reader.send(UiEvent::Frame {
+                                        width,
+                                        height,
+                                        rgba,
+                                        compressed_kb,
+                                    });
+                                    ctx_for_reader.request_repaint();
+                                }
+                            }
+                        }
+                        NetPacket::ChatMessage { sender, text, time } => {
+                            let _ = tx_for_reader.send(UiEvent::Chat { sender, text, time });
+                            ctx_for_reader.request_repaint();
+                        }
+                        NetPacket::ClipboardSync { text } => {
+                            let _ = tx_for_reader.send(UiEvent::RemoteClipboard(text));
+                            ctx_for_reader.request_repaint();
+                        }
+                        _ => {}
+                    }
+                }
+            };
+
+            tokio::select! {
+                _ = write_loop => {}
+                _ = read_loop => {}
             }
 
             let _ = ui_tx.send(UiEvent::Disconnected(
