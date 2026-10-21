@@ -135,6 +135,39 @@ async fn read_packet<R: AsyncReadExt + Unpin>(stream: &mut R) -> std::io::Result
     }
 }
 
+fn egui_key_to_vk(key: egui::Key) -> Option<u16> {
+    match key {
+        egui::Key::ArrowDown => Some(0x28),
+        egui::Key::ArrowLeft => Some(0x25),
+        egui::Key::ArrowRight => Some(0x27),
+        egui::Key::ArrowUp => Some(0x26),
+        egui::Key::Escape => Some(0x1B),
+        egui::Key::Tab => Some(0x09),
+        egui::Key::Backspace => Some(0x08),
+        egui::Key::Enter => Some(0x0D),
+        egui::Key::Space => Some(0x20),
+        egui::Key::Insert => Some(0x2D),
+        egui::Key::Delete => Some(0x2E),
+        egui::Key::Home => Some(0x24),
+        egui::Key::End => Some(0x23),
+        egui::Key::PageUp => Some(0x21),
+        egui::Key::PageDown => Some(0x22),
+        egui::Key::F1 => Some(0x70),
+        egui::Key::F2 => Some(0x71),
+        egui::Key::F3 => Some(0x72),
+        egui::Key::F4 => Some(0x73),
+        egui::Key::F5 => Some(0x74),
+        egui::Key::F6 => Some(0x75),
+        egui::Key::F7 => Some(0x76),
+        egui::Key::F8 => Some(0x77),
+        egui::Key::F9 => Some(0x78),
+        egui::Key::F10 => Some(0x79),
+        egui::Key::F11 => Some(0x7A),
+        egui::Key::F12 => Some(0x7B),
+        _ => None,
+    }
+}
+
 /// Servidor Anfitrión (Host) que escucha conexiones entrantes en segundo plano (puerto 7890+)
 async fn run_host_server(
     host_cfg: Arc<HostSharedConfig>,
@@ -167,6 +200,41 @@ async fn run_host_server(
     )));
     egui_ctx.request_repaint();
 
+    // Canal broadcast para compartir la captura de video entre N clientes simultáneos sin costo adicional de CPU
+    let (frame_bcast_tx, _) = tokio::sync::broadcast::channel::<Arc<NetPacket>>(8);
+
+    // Tarea centralizada de captura de pantalla (Single-Capture Multi-Client)
+    let bcast_tx_clone = frame_bcast_tx.clone();
+    let cfg_capture = host_cfg.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(75));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let clients = cfg_capture.active_clients.load(Ordering::Relaxed);
+            if clients == 0 || !cfg_capture.allow_connections.load(Ordering::Relaxed) {
+                continue;
+            }
+            let frame_opt = tokio::task::spawn_blocking(move || {
+                let (w, h, rgba) = remote::win_io::capture_screen_rgba(2)?;
+                let compressed = compress_bytes(&rgba);
+                Some((w, h, compressed))
+            })
+            .await
+            .ok()
+            .flatten();
+
+            if let Some((w, h, compressed_rgba)) = frame_opt {
+                let pkt = Arc::new(NetPacket::VideoFrame {
+                    width: w,
+                    height: h,
+                    compressed_rgba,
+                });
+                let _ = bcast_tx_clone.send(pkt);
+            }
+        }
+    });
+
     loop {
         let Ok((mut stream, peer_addr)) = listener.accept().await else {
             continue;
@@ -191,13 +259,14 @@ async fn run_host_server(
         let cfg_clone = host_cfg.clone();
         let tx_clone = ui_tx.clone();
         let ctx_clone = egui_ctx.clone();
+        let mut frame_rx = frame_bcast_tx.subscribe();
 
         tokio::spawn(async move {
             // 1. Leer petición de autenticación
             let Ok(NetPacket::AuthRequest {
                 pin,
                 client_name,
-                scale_div,
+                scale_div: _,
             }) = read_packet(&mut stream).await
             else {
                 return;
@@ -245,47 +314,19 @@ async fn run_host_server(
             )));
             ctx_clone.request_repaint();
 
-            let current_scale = Arc::new(AtomicU32::new(scale_div.clamp(1, 4)));
-            let scale_for_writer = current_scale.clone();
-            let cfg_for_writer = cfg_clone.clone();
-
             // Separar el socket TCP en mitad de lectura y mitad de escritura independientes
-            // para evitar que `tokio::select!` cancele `read_exact` a mitad de un paquete
             let (mut reader, mut writer) = stream.into_split();
 
             let write_loop = async move {
-                let mut interval = tokio::time::interval(Duration::from_millis(85));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    interval.tick().await;
-                    if !cfg_for_writer.allow_connections.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let div = scale_for_writer.load(Ordering::Relaxed);
-                    // Capturar y comprimir en hilo bloqueante para no frenar el runtime
-                    let frame_opt = tokio::task::spawn_blocking(move || {
-                        let (w, h, rgba) = remote::win_io::capture_screen_rgba(div)?;
-                        let compressed = compress_bytes(&rgba);
-                        Some((w, h, compressed))
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-
-                    if let Some((w, h, compressed_rgba)) = frame_opt {
-                        if write_packet(
-                            &mut writer,
-                            &NetPacket::VideoFrame {
-                                width: w,
-                                height: h,
-                                compressed_rgba,
-                            },
-                        )
-                        .await
-                        .is_err()
-                        {
-                            break;
+                    match frame_rx.recv().await {
+                        Ok(pkt_arc) => {
+                            if write_packet(&mut writer, &pkt_arc).await.is_err() {
+                                break;
+                            }
                         }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             };
@@ -312,13 +353,25 @@ async fn run_host_server(
                                 remote::win_io::inject_mouse_click(norm_x, norm_y, button, pressed);
                             }
                         }
+                        NetPacket::MouseWheel { delta_y } => {
+                            if cfg_for_reader.allow_input_control.load(Ordering::Relaxed) {
+                                remote::win_io::inject_mouse_wheel(delta_y);
+                            }
+                        }
                         NetPacket::KeyPress { vk } => {
                             if cfg_for_reader.allow_input_control.load(Ordering::Relaxed) {
                                 remote::win_io::inject_key_press(vk);
                             }
                         }
-                        NetPacket::SetQuality { scale_div } => {
-                            current_scale.store(scale_div.clamp(1, 4), Ordering::Relaxed);
+                        NetPacket::KeyEvent { vk, pressed } => {
+                            if cfg_for_reader.allow_input_control.load(Ordering::Relaxed) {
+                                remote::win_io::inject_key_event(vk, pressed);
+                            }
+                        }
+                        NetPacket::TextInput { text } => {
+                            if cfg_for_reader.allow_input_control.load(Ordering::Relaxed) {
+                                remote::win_io::inject_text(&text);
+                            }
                         }
                         NetPacket::ChatMessage { sender, text, time } => {
                             let _ = tx_for_reader.send(UiEvent::Chat { sender, text, time });
@@ -370,6 +423,7 @@ pub struct AnyRustApp {
     frame_kb: usize,
     last_frame_instant: Instant,
     last_mouse_send: Instant,
+    last_sent_mouse_pos: Option<(f32, f32)>,
 
     // Historial de equipos recientes y Chat
     recent_peers: Vec<RecentPeer>,
@@ -437,6 +491,7 @@ impl AnyRustApp {
             frame_kb: 0,
             last_frame_instant: Instant::now(),
             last_mouse_send: Instant::now(),
+            last_sent_mouse_pos: None,
             recent_peers,
             chat_messages: Vec::new(),
             chat_input: String::new(),
@@ -657,6 +712,7 @@ impl AnyRustApp {
         self.is_connected = false;
         self.is_connecting = false;
         self.remote_texture = None;
+        self.last_sent_mouse_pos = None;
         self.status_banner = "🔌 Sesión desconectada.".to_string();
     }
 }
@@ -1097,19 +1153,33 @@ impl eframe::App for AnyRustApp {
                         egui::Color32::WHITE,
                     );
 
-                    // Si el control remoto está activo, enviar eventos de Mouse al equipo remoto
+                    // Si el control remoto está activo, enviar eventos de Mouse y Teclado al equipo remoto
                     if self.remote_control_enabled {
+                        if response.clicked() {
+                            response.request_focus();
+                        }
+
                         if let Some(pos) = response.hover_pos() {
                             let norm_x = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
                             let norm_y = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
 
-                            if self.last_mouse_send.elapsed() > Duration::from_millis(35) {
+                            // CORRECCIÓN CLAVE DE CURSOR:
+                            // Solo enviar MouseMove si las coordenadas cambiaron de posición
+                            // para que cuando el mouse esté quieto NO bloquee el cursor del usuario local en el host
+                            let moved = match self.last_sent_mouse_pos {
+                                Some((lx, ly)) => (lx - norm_x).abs() > 0.001 || (ly - norm_y).abs() > 0.001,
+                                None => true,
+                            };
+
+                            if moved && self.last_mouse_send.elapsed() > Duration::from_millis(30) {
+                                self.last_sent_mouse_pos = Some((norm_x, norm_y));
+                                self.last_mouse_send = Instant::now();
                                 if let Some(tx) = &self.client_out_tx {
                                     let _ = tx.send(NetPacket::MouseMove { norm_x, norm_y });
                                 }
-                                self.last_mouse_send = Instant::now();
                             }
 
+                            // Botón Izquierdo
                             if ui.input(|i| i.pointer.primary_pressed()) {
                                 if let Some(tx) = &self.client_out_tx {
                                     let _ = tx.send(NetPacket::MouseClick {
@@ -1130,6 +1200,8 @@ impl eframe::App for AnyRustApp {
                                     });
                                 }
                             }
+
+                            // Botón Derecho
                             if ui.input(|i| i.pointer.secondary_pressed()) {
                                 if let Some(tx) = &self.client_out_tx {
                                     let _ = tx.send(NetPacket::MouseClick {
@@ -1148,6 +1220,58 @@ impl eframe::App for AnyRustApp {
                                         button: 1,
                                         pressed: false,
                                     });
+                                }
+                            }
+
+                            // Botón Central (Scroll click)
+                            if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle)) {
+                                if let Some(tx) = &self.client_out_tx {
+                                    let _ = tx.send(NetPacket::MouseClick {
+                                        norm_x,
+                                        norm_y,
+                                        button: 2,
+                                        pressed: true,
+                                    });
+                                }
+                            }
+                            if ui.input(|i| i.pointer.button_released(egui::PointerButton::Middle)) {
+                                if let Some(tx) = &self.client_out_tx {
+                                    let _ = tx.send(NetPacket::MouseClick {
+                                        norm_x,
+                                        norm_y,
+                                        button: 2,
+                                        pressed: false,
+                                    });
+                                }
+                            }
+
+                            // Rueda del Mouse (Scroll Wheel)
+                            let scroll_delta_y = ui.input(|i| i.raw_scroll_delta.y);
+                            if scroll_delta_y.abs() > 0.5 {
+                                let delta = if scroll_delta_y > 0.0 { 1 } else { -1 };
+                                if let Some(tx) = &self.client_out_tx {
+                                    let _ = tx.send(NetPacket::MouseWheel { delta_y: delta });
+                                }
+                            }
+
+                            // Teclado: Texto y Teclas de Control
+                            if response.has_focus() || response.hovered() {
+                                for event in ui.input(|i| i.events.clone()) {
+                                    match event {
+                                        egui::Event::Text(text) => {
+                                            if let Some(tx) = &self.client_out_tx {
+                                                let _ = tx.send(NetPacket::TextInput { text });
+                                            }
+                                        }
+                                        egui::Event::Key { key, pressed, .. } => {
+                                            if let Some(vk) = egui_key_to_vk(key) {
+                                                if let Some(tx) = &self.client_out_tx {
+                                                    let _ = tx.send(NetPacket::KeyEvent { vk, pressed });
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }

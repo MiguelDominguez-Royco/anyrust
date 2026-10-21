@@ -33,11 +33,21 @@ pub enum NetPacket {
     MouseClick {
         norm_x: f32,
         norm_y: f32,
-        button: u8, // 0 = Izquierdo, 1 = Derecho
+        button: u8, // 0 = Izquierdo, 1 = Derecho, 2 = Central
         pressed: bool,
+    },
+    MouseWheel {
+        delta_y: i32,
     },
     KeyPress {
         vk: u16,
+    },
+    KeyEvent {
+        vk: u16,
+        pressed: bool,
+    },
+    TextInput {
+        text: String,
     },
     ChatMessage {
         sender: String,
@@ -126,8 +136,10 @@ pub mod win_io {
         SRCCOPY,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        keybd_event, mouse_event, KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+        keybd_event, mouse_event, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+        MOUSEEVENTF_WHEEL,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXSCREEN, SM_CYSCREEN,
@@ -265,9 +277,18 @@ pub mod win_io {
                 (0, false) => MOUSEEVENTF_LEFTUP,
                 (1, true) => MOUSEEVENTF_RIGHTDOWN,
                 (1, false) => MOUSEEVENTF_RIGHTUP,
+                (2, true) => MOUSEEVENTF_MIDDLEDOWN,
+                (2, false) => MOUSEEVENTF_MIDDLEUP,
                 _ => return,
             };
             mouse_event(flag, 0, 0, 0, 0);
+        }
+    }
+
+    pub fn inject_mouse_wheel(delta_y: i32) {
+        unsafe {
+            // En Windows, cada clic de rueda son 120 unidades (i32)
+            mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta_y * 120, 0);
         }
     }
 
@@ -275,6 +296,51 @@ pub mod win_io {
         unsafe {
             keybd_event(vk as u8, 0, 0, 0);
             keybd_event(vk as u8, 0, KEYEVENTF_KEYUP, 0);
+        }
+    }
+
+    pub fn inject_key_event(vk: u16, pressed: bool) {
+        unsafe {
+            let flags = if pressed { 0 } else { KEYEVENTF_KEYUP };
+            keybd_event(vk as u8, 0, flags, 0);
+        }
+    }
+
+    pub fn inject_text(text: &str) {
+        for c in text.encode_utf16() {
+            unsafe {
+                let mut inputs = [
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: 0,
+                                wScan: c,
+                                dwFlags: KEYEVENTF_UNICODE,
+                                time: 0,
+                                dwExtraInfo: 0,
+                            },
+                        },
+                    },
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: 0,
+                                wScan: c,
+                                dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                                time: 0,
+                                dwExtraInfo: 0,
+                            },
+                        },
+                    },
+                ];
+                SendInput(
+                    inputs.len() as u32,
+                    inputs.as_mut_ptr(),
+                    std::mem::size_of::<INPUT>() as i32,
+                );
+            }
         }
     }
 }
@@ -303,6 +369,9 @@ pub mod win_io {
 
     pub fn inject_mouse_move(_norm_x: f32, _norm_y: f32) {}
     pub fn inject_mouse_click(_norm_x: f32, _norm_y: f32, _button: u8, _pressed: bool) {}
+    pub fn inject_mouse_wheel(_delta_y: i32) {}
     pub fn inject_key_press(_vk: u16) {}
+    pub fn inject_key_event(_vk: u16, _pressed: bool) {}
+    pub fn inject_text(_text: &str) {}
 }
 
