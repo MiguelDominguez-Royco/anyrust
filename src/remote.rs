@@ -278,3 +278,31 @@ pub mod win_io {
         }
     }
 }
+
+#[cfg(not(windows))]
+pub mod win_io {
+    pub fn get_screen_size() -> (u32, u32) {
+        (1280, 720)
+    }
+
+    pub fn capture_screen_rgba(scale_div: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let div = scale_div.clamp(1, 4);
+        let w = 1280 / div;
+        let h = 720 / div;
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.push(((x * 255) / w.max(1)) as u8);
+                rgba.push(((y * 255) / h.max(1)) as u8);
+                rgba.push(46);
+                rgba.push(255);
+            }
+        }
+        Some((w, h, rgba))
+    }
+
+    pub fn inject_mouse_move(_norm_x: f32, _norm_y: f32) {}
+    pub fn inject_mouse_click(_norm_x: f32, _norm_y: f32, _button: u8, _pressed: bool) {}
+    pub fn inject_key_press(_vk: u16) {}
+}
+
