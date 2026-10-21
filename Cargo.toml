@@ -1,0 +1,24 @@
+[package]
+name = "anyrust"
+version = "1.0.0"
+edition = "2021"
+description = "Clon de AnyDesk en Rust - Escritorio Remoto en Tiempo Real"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+tokio = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+flate2 = "1.0"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
