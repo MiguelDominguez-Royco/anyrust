@@ -1,6 +1,6 @@
 [package]
 name = "anyrust"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 description = "Clon de AnyDesk en Rust - Escritorio Remoto en Tiempo Real"
 
@@ -11,6 +11,7 @@ tokio = { version = "1.40", features = ["rt-multi-thread", "net", "io-util", "sy
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 flate2 = "1.0"
+qrcode = { version = "0.14", default-features = false }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"

@@ -434,6 +434,7 @@ pub struct AnyRustApp {
     host_pin_input: String,
     host_require_2fa: bool,
     host_totp_secret: String,
+    totp_qr_texture: Option<egui::TextureHandle>,
 
     // Estado de conexión saliente (Cliente)
     target_address_input: String,
@@ -510,6 +511,7 @@ impl AnyRustApp {
             host_pin_input: default_pin,
             host_require_2fa: false,
             host_totp_secret: default_totp_secret,
+            totp_qr_texture: None,
             target_address_input: "127.0.0.1".to_string(),
             target_pin_input: "1234".to_string(),
             target_2fa_input: String::new(),
@@ -574,6 +576,21 @@ impl AnyRustApp {
         visuals.window_rounding = egui::Rounding::same(8.0);
         style.visuals = visuals;
         ctx.set_style(style);
+    }
+
+    fn update_qr_texture(&mut self, ctx: &egui::Context) {
+        let otpauth_uri = format!(
+            "otpauth://totp/AnyRust:{}?secret={}&issuer=AnyRust",
+            self.local_id.replace(' ', ""),
+            self.host_totp_secret
+        );
+        if let Some(img) = totp::generate_qr_image(&otpauth_uri) {
+            self.totp_qr_texture = Some(ctx.load_texture(
+                "totp_qr_code",
+                img,
+                egui::TextureOptions::NEAREST,
+            ));
+        }
     }
 
     fn connect_to_peer(&mut self, ctx: &egui::Context) {
@@ -987,12 +1004,30 @@ impl eframe::App for AnyRustApp {
                 }
 
                 if req_2fa {
+                    if self.totp_qr_texture.is_none() {
+                        self.update_qr_texture(ctx);
+                    }
                     ctx.request_repaint_after(Duration::from_millis(500));
                     egui::Frame::none()
                         .fill(ui.visuals().extreme_bg_color)
                         .rounding(egui::Rounding::same(6.0))
                         .inner_margin(egui::Margin::same(8.0))
                         .show(ui, |ui| {
+                            // Código QR centrado para escanear con la app del celular
+                            if let Some(tex) = &self.totp_qr_texture {
+                                ui.vertical_centered(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("📷 Escanea con tu Authenticator:")
+                                            .strong()
+                                            .size(11.5)
+                                            .color(accent_blue),
+                                    );
+                                    ui.add_space(3.0);
+                                    ui.image((tex.id(), egui::vec2(140.0, 140.0)));
+                                    ui.add_space(3.0);
+                                });
+                            }
+
                             ui.small("Clave Secreta TOTP (Base32):");
                             ui.horizontal(|ui| {
                                 ui.monospace(
@@ -1009,12 +1044,13 @@ impl eframe::App for AnyRustApp {
                                 }
                                 if ui
                                     .button("🎲")
-                                    .on_hover_text("Generar nueva clave secreta")
+                                    .on_hover_text("Generar nueva clave secreta y QR")
                                     .clicked()
                                 {
                                     let new_sec = totp::generate_random_secret();
                                     self.host_totp_secret = new_sec.clone();
                                     *self.host_cfg.totp_secret.lock().unwrap() = new_sec;
+                                    self.totp_qr_texture = None;
                                 }
                             });
 

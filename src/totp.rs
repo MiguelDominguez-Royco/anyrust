@@ -180,3 +180,32 @@ pub fn current_unix_time() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+/// Genera una imagen ColorImage de egui con el código QR y un margen blanco óptimo para escaneo con cámara
+pub fn generate_qr_image(content: &str) -> Option<eframe::egui::ColorImage> {
+    let code = qrcode::QrCode::new(content.as_bytes()).ok()?;
+    let border = 2;
+    let qr_width = code.width();
+    let total_width = qr_width + border * 2;
+    let mut pixels = vec![eframe::egui::Color32::WHITE; total_width * total_width];
+
+    let colors = code.to_colors();
+    for y in 0..qr_width {
+        for x in 0..qr_width {
+            let color = colors[y * qr_width + x];
+            let px = x + border;
+            let py = y + border;
+            let idx = py * total_width + px;
+            if color == qrcode::Color::Dark {
+                pixels[idx] = eframe::egui::Color32::BLACK;
+            } else {
+                pixels[idx] = eframe::egui::Color32::WHITE;
+            }
+        }
+    }
+
+    Some(eframe::egui::ColorImage {
+        size: [total_width, total_width],
+        pixels,
+    })
+}
