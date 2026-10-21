@@ -1,6 +1,6 @@
 [package]
 name = "anyrust"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "Clon de AnyDesk en Rust - Escritorio Remoto en Tiempo Real"
 

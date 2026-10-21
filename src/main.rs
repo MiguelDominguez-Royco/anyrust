@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod remote;
+mod totp;
 
 use chrono::Local;
 use eframe::egui;
@@ -36,6 +37,8 @@ enum ThemeFlavor {
 
 struct HostSharedConfig {
     pub pin: Mutex<String>,
+    pub require_2fa: AtomicBool,
+    pub totp_secret: Mutex<String>,
     pub allow_connections: AtomicBool,
     pub allow_input_control: AtomicBool,
     pub allow_clipboard: AtomicBool,
@@ -265,6 +268,7 @@ async fn run_host_server(
             // 1. Leer petición de autenticación
             let Ok(NetPacket::AuthRequest {
                 pin,
+                totp_code,
                 client_name,
                 scale_div: _,
             }) = read_packet(&mut stream).await
@@ -286,6 +290,26 @@ async fn run_host_server(
                 )
                 .await;
                 return;
+            }
+
+            // Verificación de Doble Factor (2FA - TOTP) si está activado por el anfitrión
+            if cfg_clone.require_2fa.load(Ordering::Relaxed) {
+                let secret = cfg_clone.totp_secret.lock().unwrap().clone();
+                let now = totp::current_unix_time();
+                if !totp::verify_totp(&secret, &totp_code, now) {
+                    let _ = write_packet(
+                        &mut stream,
+                        &NetPacket::AuthResponse {
+                            accepted: false,
+                            message: "Código 2FA de Authenticator inválido o expirado.".to_string(),
+                            screen_width: 0,
+                            screen_height: 0,
+                            host_name: String::new(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
             }
 
             let (sw, sh) = remote::win_io::get_screen_size();
@@ -408,10 +432,13 @@ pub struct AnyRustApp {
     local_id: String,
     host_cfg: Arc<HostSharedConfig>,
     host_pin_input: String,
+    host_require_2fa: bool,
+    host_totp_secret: String,
 
     // Estado de conexión saliente (Cliente)
     target_address_input: String,
     target_pin_input: String,
+    target_2fa_input: String,
     scale_div: u32,
     is_connecting: bool,
     is_connected: bool,
@@ -443,9 +470,12 @@ impl AnyRustApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (local_ip, local_id) = get_local_ip_and_id();
         let default_pin = "1234".to_string();
+        let default_totp_secret = totp::generate_random_secret();
 
         let host_cfg = Arc::new(HostSharedConfig {
             pin: Mutex::new(default_pin.clone()),
+            require_2fa: AtomicBool::new(false),
+            totp_secret: Mutex::new(default_totp_secret.clone()),
             allow_connections: AtomicBool::new(true),
             allow_input_control: AtomicBool::new(true),
             allow_clipboard: AtomicBool::new(true),
@@ -478,8 +508,11 @@ impl AnyRustApp {
             local_id,
             host_cfg,
             host_pin_input: default_pin,
+            host_require_2fa: false,
+            host_totp_secret: default_totp_secret,
             target_address_input: "127.0.0.1".to_string(),
             target_pin_input: "1234".to_string(),
+            target_2fa_input: String::new(),
             scale_div: 2,
             is_connecting: false,
             is_connected: false,
@@ -549,6 +582,7 @@ impl AnyRustApp {
         }
         let resolved_addr = resolve_target_address(&self.target_address_input, &self.local_ip);
         let pin = self.target_pin_input.clone();
+        let totp_code = self.target_2fa_input.trim().to_string();
         let scale_div = self.scale_div;
 
         // Si el usuario se conecta a sí mismo (127.0.0.1 o su propia IP), desactivar control de mouse inicial para evitar bucle infinito
@@ -599,6 +633,7 @@ impl AnyRustApp {
                 &mut stream,
                 &NetPacket::AuthRequest {
                     pin,
+                    totp_code,
                     client_name,
                     scale_div,
                 },
@@ -940,6 +975,78 @@ impl eframe::App for AnyRustApp {
                     }
                 });
 
+                ui.add_space(6.0);
+                let mut req_2fa = self.host_cfg.require_2fa.load(Ordering::Relaxed);
+                if ui
+                    .checkbox(&mut req_2fa, "🔐 Requerir 2FA (Authenticator)")
+                    .on_hover_text("Pide un código de 6 dígitos de Google o Microsoft Authenticator al conectarse")
+                    .changed()
+                {
+                    self.host_cfg.require_2fa.store(req_2fa, Ordering::Relaxed);
+                    self.host_require_2fa = req_2fa;
+                }
+
+                if req_2fa {
+                    ctx.request_repaint_after(Duration::from_millis(500));
+                    egui::Frame::none()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::same(8.0))
+                        .show(ui, |ui| {
+                            ui.small("Clave Secreta TOTP (Base32):");
+                            ui.horizontal(|ui| {
+                                ui.monospace(
+                                    egui::RichText::new(&self.host_totp_secret)
+                                        .color(accent_green)
+                                        .strong(),
+                                );
+                                if ui
+                                    .button("📋")
+                                    .on_hover_text("Copiar clave para Google/Microsoft Authenticator")
+                                    .clicked()
+                                {
+                                    ui.output_mut(|o| o.copied_text = self.host_totp_secret.clone());
+                                }
+                                if ui
+                                    .button("🎲")
+                                    .on_hover_text("Generar nueva clave secreta")
+                                    .clicked()
+                                {
+                                    let new_sec = totp::generate_random_secret();
+                                    self.host_totp_secret = new_sec.clone();
+                                    *self.host_cfg.totp_secret.lock().unwrap() = new_sec;
+                                }
+                            });
+
+                            let now = totp::current_unix_time();
+                            let current_otp = totp::generate_totp_code(&self.host_totp_secret, now)
+                                .unwrap_or_else(|| "------".to_string());
+                            let seconds_left = 30 - (now % 30);
+                            ui.horizontal(|ui| {
+                                ui.small("Código actual:");
+                                ui.heading(
+                                    egui::RichText::new(&current_otp)
+                                        .strong()
+                                        .color(accent_blue),
+                                );
+                                ui.small(format!("({}s)", seconds_left));
+                            });
+
+                            let otpauth_uri = format!(
+                                "otpauth://totp/AnyRust:{}?secret={}&issuer=AnyRust",
+                                self.local_id.replace(' ', ""),
+                                self.host_totp_secret
+                            );
+                            if ui
+                                .button("📋 Copiar enlace otpauth://")
+                                .on_hover_text("Enlace universal para importar en apps de autenticación")
+                                .clicked()
+                            {
+                                ui.output_mut(|o| o.copied_text = otpauth_uri);
+                            }
+                        });
+                }
+
                 ui.add_space(8.0);
                 ui.separator();
                 ui.label(egui::RichText::new("🛡 Permisos de Anfitrión:").strong());
@@ -1043,8 +1150,16 @@ impl eframe::App for AnyRustApp {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.target_pin_input)
                                 .hint_text("1234")
-                                .desired_width(70.0),
+                                .desired_width(55.0),
                         );
+
+                        ui.label("2FA:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.target_2fa_input)
+                                .hint_text("6 dígitos")
+                                .desired_width(70.0),
+                        )
+                        .on_hover_text("Ingresa el código de 6 dígitos de Google o Microsoft Authenticator si el equipo remoto requiere 2FA");
 
                         ui.label("Calidad:");
                         let prev_scale = self.scale_div;

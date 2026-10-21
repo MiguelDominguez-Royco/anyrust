@@ -11,6 +11,8 @@ pub const DEFAULT_PORT: u16 = 7890;
 pub enum NetPacket {
     AuthRequest {
         pin: String,
+        #[serde(default)]
+        totp_code: String,
         client_name: String,
         scale_div: u32,
     },
