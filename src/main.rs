@@ -6,8 +6,8 @@ mod totp;
 use chrono::Local;
 use eframe::egui;
 use remote::{
-    compress_bytes, decompress_bytes, get_local_ip_and_id, resolve_target_address, NetPacket,
-    DEFAULT_PORT,
+    compress_bytes, decompress_bytes, get_local_ip_and_id, get_system_clipboard,
+    resolve_target_address, save_transferred_file, set_system_clipboard, NetPacket, DEFAULT_PORT,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -65,6 +65,13 @@ enum UiEvent {
         time: String,
     },
     RemoteClipboard(String),
+    FileReceived {
+        filename: String,
+        path: String,
+        size_kb: usize,
+    },
+    #[allow(dead_code)]
+    FileSentAck(String),
     StatusInfo(String),
 }
 
@@ -108,7 +115,7 @@ async fn read_packet<R: AsyncReadExt + Unpin>(stream: &mut R) -> std::io::Result
     stream.read_exact(&mut header).await?;
     let kind = header[0];
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if len > 32 * 1024 * 1024 {
+    if len > 128 * 1024 * 1024 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Paquete demasiado grande",
@@ -403,8 +410,25 @@ async fn run_host_server(
                         }
                         NetPacket::ClipboardSync { text } => {
                             if cfg_for_reader.allow_clipboard.load(Ordering::Relaxed) {
+                                let _ = set_system_clipboard(&text);
                                 let _ = tx_for_reader.send(UiEvent::RemoteClipboard(text));
                                 ctx_for_reader.request_repaint();
+                            }
+                        }
+                        NetPacket::FileTransfer {
+                            filename,
+                            compressed_data,
+                        } => {
+                            if let Some(data) = decompress_bytes(&compressed_data) {
+                                let size_kb = data.len() / 1024;
+                                if let Ok(saved_path) = save_transferred_file(&filename, &data) {
+                                    let _ = tx_for_reader.send(UiEvent::FileReceived {
+                                        filename,
+                                        path: saved_path,
+                                        size_kb,
+                                    });
+                                    ctx_for_reader.request_repaint();
+                                }
                             }
                         }
                         _ => {}
@@ -459,6 +483,14 @@ pub struct AnyRustApp {
     chat_input: String,
     status_banner: String,
     theme: ThemeFlavor,
+
+    // Portapapeles y Transferencia de Archivos
+    last_sent_clipboard: String,
+    last_clipboard_check: Instant,
+    clipboard_bidirectional: bool,
+    show_remote_window: bool,
+    use_independent_window: bool,
+    transferred_files: Vec<(String, String, String)>,
 
     // Canales de comunicación con Tokio
     rt: Runtime,
@@ -532,6 +564,12 @@ impl AnyRustApp {
             chat_input: String::new(),
             status_banner: format!("🟢 Servidor activo escuchando en el puerto TCP {}", DEFAULT_PORT),
             theme,
+            last_sent_clipboard: String::new(),
+            last_clipboard_check: Instant::now(),
+            clipboard_bidirectional: false,
+            show_remote_window: true,
+            use_independent_window: true,
+            transferred_files: Vec::new(),
             rt,
             ui_rx,
             ui_tx,
@@ -739,8 +777,25 @@ impl AnyRustApp {
                             ctx_for_reader.request_repaint();
                         }
                         NetPacket::ClipboardSync { text } => {
+                            let _ = set_system_clipboard(&text);
                             let _ = tx_for_reader.send(UiEvent::RemoteClipboard(text));
                             ctx_for_reader.request_repaint();
+                        }
+                        NetPacket::FileTransfer {
+                            filename,
+                            compressed_data,
+                        } => {
+                            if let Some(data) = decompress_bytes(&compressed_data) {
+                                let size_kb = data.len() / 1024;
+                                if let Ok(saved_path) = save_transferred_file(&filename, &data) {
+                                    let _ = tx_for_reader.send(UiEvent::FileReceived {
+                                        filename,
+                                        path: saved_path,
+                                        size_kb,
+                                    });
+                                    ctx_for_reader.request_repaint();
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -765,7 +820,312 @@ impl AnyRustApp {
         self.is_connecting = false;
         self.remote_texture = None;
         self.last_sent_mouse_pos = None;
+        self.show_remote_window = false;
+        self.last_sent_clipboard.clear();
         self.status_banner = "🔌 Sesión desconectada.".to_string();
+    }
+
+    fn render_remote_session_content(&mut self, ui: &mut egui::Ui, is_independent_window: bool) {
+        let is_light = self.theme == ThemeFlavor::LatteLight;
+        let accent_red = if is_light {
+            egui::Color32::from_rgb(210, 15, 57)
+        } else {
+            egui::Color32::from_rgb(243, 139, 168)
+        };
+        let accent_green = if is_light {
+            egui::Color32::from_rgb(64, 160, 43)
+        } else {
+            egui::Color32::from_rgb(166, 227, 161)
+        };
+
+        // 1. Barra de control superior
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                accent_green,
+                egui::RichText::new(format!(
+                    "🖥 Viendo: {} ({}x{}) | {:.1} FPS | ~{} KB/frame",
+                    self.remote_host_name,
+                    self.remote_screen_size.0,
+                    self.remote_screen_size.1,
+                    self.fps,
+                    self.frame_kb
+                ))
+                .strong(),
+            );
+            ui.separator();
+
+            ui.checkbox(
+                &mut self.remote_control_enabled,
+                "🖱️ Control de Mouse y Teclado",
+            )
+            .on_hover_text("Permite enviar clicks, movimiento y pulsaciones de teclas al equipo remoto");
+
+            ui.separator();
+            egui::ComboBox::from_id_salt("cb_mode_selector")
+                .selected_text(if self.clipboard_bidirectional {
+                    "📋 Portapapeles: Bidireccional"
+                } else {
+                    "📋 Portapapeles: Unidireccional"
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.clipboard_bidirectional,
+                        false,
+                        "📋 Unidireccional (Tu PC ➔ Remoto)",
+                    );
+                    ui.selectable_value(
+                        &mut self.clipboard_bidirectional,
+                        true,
+                        "📋 Bidireccional (Ambos sentidos)",
+                    );
+                });
+
+            ui.separator();
+            ui.label("Calidad:");
+            let prev_scale = self.scale_div;
+            egui::ComboBox::from_id_salt("quality_combo_remote")
+                .selected_text(match self.scale_div {
+                    1 => "💎 HD (100%)",
+                    2 => "⚖ Equilibrada (50%)",
+                    _ => "⚡ Rápida (33%)",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.scale_div, 1, "💎 HD (100%)");
+                    ui.selectable_value(&mut self.scale_div, 2, "⚖ Equilibrada (50%)");
+                    ui.selectable_value(&mut self.scale_div, 3, "⚡ Rápida (33%)");
+                });
+            if prev_scale != self.scale_div {
+                if let Some(tx) = &self.client_out_tx {
+                    let _ = tx.send(NetPacket::SetQuality {
+                        scale_div: self.scale_div,
+                    });
+                }
+            }
+
+            ui.separator();
+            if is_independent_window {
+                if ui.button("📥 Integrar en Ventana Principal").clicked() {
+                    self.use_independent_window = false;
+                }
+            } else {
+                if ui.button("🪟 Abrir en Ventana Separada").clicked() {
+                    self.use_independent_window = true;
+                    self.show_remote_window = true;
+                }
+            }
+
+            let disc_btn = egui::Button::new(
+                egui::RichText::new("🔌 Desconectar")
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            )
+            .fill(accent_red);
+            if ui.add(disc_btn).clicked() {
+                self.disconnect();
+            }
+        });
+
+        ui.separator();
+
+        // 2. Detección de Archivos Arrastrados (Drag & Drop File Transfer)
+        let dropped_files = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        if !dropped_files.is_empty() {
+            for f in dropped_files {
+                if let Some(path) = f.path {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        let filename = path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        let size_kb = bytes.len() / 1024;
+                        let compressed = compress_bytes(&bytes);
+                        if let Some(tx) = &self.client_out_tx {
+                            let _ = tx.send(NetPacket::FileTransfer {
+                                filename: filename.clone(),
+                                compressed_data: compressed,
+                            });
+                            self.status_banner = format!(
+                                "📤 Enviando archivo '{}' ({} KB)...",
+                                filename, size_kb
+                            );
+                            let time = Local::now().format("%H:%M").to_string();
+                            self.chat_messages.push((
+                                "Yo".to_string(),
+                                format!("📤 Envié archivo: {} ({} KB)", filename, size_kb),
+                                time,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let is_hovering_file = !ui.ctx().input(|i| i.raw.hovered_files.is_empty());
+
+        // 3. Lienzo de Escritorio Remoto
+        if let Some(tex) = &self.remote_texture {
+            let avail = ui.available_size();
+            let tex_size = tex.size_vec2();
+            let aspect = (tex_size.x / tex_size.y.max(1.0)).max(0.1);
+
+            let mut draw_w = avail.x;
+            let mut draw_h = draw_w / aspect;
+            if draw_h > avail.y {
+                draw_h = avail.y;
+                draw_w = draw_h * aspect;
+            }
+
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(draw_w, draw_h),
+                egui::Sense::click_and_drag(),
+            );
+
+            ui.painter().image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+
+            // Si el usuario está arrastrando un archivo sobre el escritorio remoto, mostrar banner visual
+            if is_hovering_file {
+                ui.painter().rect_filled(
+                    rect,
+                    egui::Rounding::ZERO,
+                    egui::Color32::from_black_alpha(160),
+                );
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "📥 SUELTA EL ARCHIVO AQUÍ PARA TRANSFERIRLO",
+                    egui::FontId::proportional(22.0),
+                    egui::Color32::WHITE,
+                );
+            }
+
+            // Mouse y Teclado
+            if self.remote_control_enabled {
+                if response.clicked() {
+                    response.request_focus();
+                }
+
+                if let Some(pos) = response.hover_pos() {
+                    let norm_x = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+                    let norm_y = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+
+                    let moved = match self.last_sent_mouse_pos {
+                        Some((lx, ly)) => (lx - norm_x).abs() > 0.001 || (ly - norm_y).abs() > 0.001,
+                        None => true,
+                    };
+
+                    if moved && self.last_mouse_send.elapsed() > Duration::from_millis(30) {
+                        self.last_sent_mouse_pos = Some((norm_x, norm_y));
+                        self.last_mouse_send = Instant::now();
+                        if let Some(tx) = &self.client_out_tx {
+                            let _ = tx.send(NetPacket::MouseMove { norm_x, norm_y });
+                        }
+                    }
+
+                    if ui.input(|i| i.pointer.primary_pressed()) {
+                        if let Some(tx) = &self.client_out_tx {
+                            let _ = tx.send(NetPacket::MouseClick {
+                                norm_x,
+                                norm_y,
+                                button: 0,
+                                pressed: true,
+                            });
+                        }
+                    }
+                    if ui.input(|i| i.pointer.primary_released()) {
+                        if let Some(tx) = &self.client_out_tx {
+                            let _ = tx.send(NetPacket::MouseClick {
+                                norm_x,
+                                norm_y,
+                                button: 0,
+                                pressed: false,
+                            });
+                        }
+                    }
+
+                    if ui.input(|i| i.pointer.secondary_pressed()) {
+                        if let Some(tx) = &self.client_out_tx {
+                            let _ = tx.send(NetPacket::MouseClick {
+                                norm_x,
+                                norm_y,
+                                button: 1,
+                                pressed: true,
+                            });
+                        }
+                    }
+                    if ui.input(|i| i.pointer.secondary_released()) {
+                        if let Some(tx) = &self.client_out_tx {
+                            let _ = tx.send(NetPacket::MouseClick {
+                                norm_x,
+                                norm_y,
+                                button: 1,
+                                pressed: false,
+                            });
+                        }
+                    }
+
+                    if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle)) {
+                        if let Some(tx) = &self.client_out_tx {
+                            let _ = tx.send(NetPacket::MouseClick {
+                                norm_x,
+                                norm_y,
+                                button: 2,
+                                pressed: true,
+                            });
+                        }
+                    }
+                    if ui.input(|i| i.pointer.button_released(egui::PointerButton::Middle)) {
+                        if let Some(tx) = &self.client_out_tx {
+                            let _ = tx.send(NetPacket::MouseClick {
+                                norm_x,
+                                norm_y,
+                                button: 2,
+                                pressed: false,
+                            });
+                        }
+                    }
+
+                    let scroll_delta_y = ui.input(|i| i.raw_scroll_delta.y);
+                    if scroll_delta_y.abs() > 0.5 {
+                        let delta = if scroll_delta_y > 0.0 { 1 } else { -1 };
+                        if let Some(tx) = &self.client_out_tx {
+                            let _ = tx.send(NetPacket::MouseWheel { delta_y: delta });
+                        }
+                    }
+
+                    if response.has_focus() || response.hovered() {
+                        for event in ui.input(|i| i.events.clone()) {
+                            match event {
+                                egui::Event::Text(text) => {
+                                    if let Some(tx) = &self.client_out_tx {
+                                        let _ = tx.send(NetPacket::TextInput { text });
+                                    }
+                                }
+                                egui::Event::Key { key, pressed, .. } => {
+                                    if let Some(vk) = egui_key_to_vk(key) {
+                                        if let Some(tx) = &self.client_out_tx {
+                                            let _ = tx.send(NetPacket::KeyEvent { vk, pressed });
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.spinner();
+                ui.label("Recibiendo primer cuadro de video del equipo remoto...");
+            });
+        }
     }
 }
 
@@ -865,11 +1225,53 @@ impl eframe::App for AnyRustApp {
                     self.chat_messages.push((sender, text, time));
                 }
                 UiEvent::RemoteClipboard(text) => {
-                    ctx.output_mut(|o| o.copied_text = text);
-                    self.status_banner = "📋 Portapapeles recibido del equipo remoto.".to_string();
+                    self.last_sent_clipboard = text.clone();
+                    let _ = set_system_clipboard(&text);
+                    self.status_banner = "📋 Portapapeles sincronizado desde el equipo remoto.".to_string();
+                }
+                UiEvent::FileReceived {
+                    filename,
+                    path,
+                    size_kb,
+                } => {
+                    let time = Local::now().format("%H:%M").to_string();
+                    self.transferred_files
+                        .push((filename.clone(), path.clone(), time.clone()));
+                    self.chat_messages.push((
+                        "Sistema".to_string(),
+                        format!(
+                            "📁 Archivo recibido: {} ({} KB) en {}",
+                            filename, size_kb, path
+                        ),
+                        time,
+                    ));
+                    self.status_banner = format!(
+                        "📁 Archivo '{}' recibido y guardado en Descargas",
+                        filename
+                    );
+                }
+                UiEvent::FileSentAck(msg) => {
+                    self.status_banner = format!("✅ {}", msg);
                 }
                 UiEvent::StatusInfo(info) => {
                     self.status_banner = info;
+                }
+            }
+        }
+
+        // Sincronización continua de Portapapeles
+        if self.is_connected && self.last_clipboard_check.elapsed() > Duration::from_millis(350) {
+            self.last_clipboard_check = Instant::now();
+            if let Some(text) = get_system_clipboard() {
+                let clean = text.trim();
+                if !clean.is_empty() && clean != self.last_sent_clipboard {
+                    self.last_sent_clipboard = clean.to_string();
+                    if let Some(tx) = &self.client_out_tx {
+                        let _ = tx.send(NetPacket::ClipboardSync {
+                            text: clean.to_string(),
+                        });
+                        self.status_banner = "📋 Texto copiado enviado al equipo remoto.".to_string();
+                    }
                 }
             }
         }
@@ -1254,185 +1656,59 @@ impl eframe::App for AnyRustApp {
             ui.add_space(8.0);
 
             if self.is_connected {
-                // Barra de control del Visor Remoto
-                ui.horizontal(|ui| {
-                    ui.colored_label(
-                        accent_green,
-                        egui::RichText::new(format!(
-                            "🖥 Viendo: {} ({}x{}) | {:.1} FPS | ~{} KB/frame",
-                            self.remote_host_name,
-                            self.remote_screen_size.0,
-                            self.remote_screen_size.1,
-                            self.fps,
-                            self.frame_kb
-                        ))
-                        .strong(),
-                    );
-                    ui.separator();
-                    ui.checkbox(
-                        &mut self.remote_control_enabled,
-                        "🖱️ Controlar Mouse y Teclado Remoto",
-                    )
-                    .on_hover_text(
-                        "Actívalo cuando te conectes a otra PC (desactívalo si pruebas en 127.0.0.1)",
-                    );
-                });
-                ui.separator();
-
-                // Lienzo de Escritorio Remoto en Tiempo Real
-                if let Some(tex) = &self.remote_texture {
-                    let avail = ui.available_size();
-                    let tex_size = tex.size_vec2();
-                    let aspect = (tex_size.x / tex_size.y.max(1.0)).max(0.1);
-
-                    let mut draw_w = avail.x;
-                    let mut draw_h = draw_w / aspect;
-                    if draw_h > avail.y {
-                        draw_h = avail.y;
-                        draw_w = draw_h * aspect;
-                    }
-
-                    let (rect, response) = ui.allocate_exact_size(
-                        egui::vec2(draw_w, draw_h),
-                        egui::Sense::click_and_drag(),
-                    );
-
-                    ui.painter().image(
-                        tex.id(),
-                        rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-
-                    // Si el control remoto está activo, enviar eventos de Mouse y Teclado al equipo remoto
-                    if self.remote_control_enabled {
-                        if response.clicked() {
-                            response.request_focus();
-                        }
-
-                        if let Some(pos) = response.hover_pos() {
-                            let norm_x = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
-                            let norm_y = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
-
-                            // CORRECCIÓN CLAVE DE CURSOR:
-                            // Solo enviar MouseMove si las coordenadas cambiaron de posición
-                            // para que cuando el mouse esté quieto NO bloquee el cursor del usuario local en el host
-                            let moved = match self.last_sent_mouse_pos {
-                                Some((lx, ly)) => (lx - norm_x).abs() > 0.001 || (ly - norm_y).abs() > 0.001,
-                                None => true,
-                            };
-
-                            if moved && self.last_mouse_send.elapsed() > Duration::from_millis(30) {
-                                self.last_sent_mouse_pos = Some((norm_x, norm_y));
-                                self.last_mouse_send = Instant::now();
-                                if let Some(tx) = &self.client_out_tx {
-                                    let _ = tx.send(NetPacket::MouseMove { norm_x, norm_y });
+                if self.use_independent_window {
+                    egui::Frame::none()
+                        .fill(card_bg)
+                        .rounding(egui::Rounding::same(8.0))
+                        .inner_margin(egui::Margin::same(14.0))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.heading(
+                                    egui::RichText::new(format!(
+                                        "🖥️ Sesión Remota Activa con '{}'",
+                                        self.remote_host_name
+                                    ))
+                                    .color(accent_green)
+                                    .strong(),
+                                );
+                                ui.separator();
+                                if ui
+                                    .button("🪟 Traer al Frente Ventana de Sesión")
+                                    .clicked()
+                                {
+                                    self.show_remote_window = true;
                                 }
-                            }
+                                if ui.button("📥 Integrar en esta Ventana").clicked() {
+                                    self.use_independent_window = false;
+                                }
+                                let disc_btn = egui::Button::new(
+                                    egui::RichText::new("🔌 Finalizar Sesión")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(accent_red);
+                                if ui.add(disc_btn).clicked() {
+                                    self.disconnect();
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label("La pantalla remota se está mostrando en una ventana secundaria flotante independiente (estilo AnyDesk).");
+                            ui.label("💡 Tip: Puedes arrastrar cualquier archivo desde el Explorador de Windows y soltarlo directamente sobre la ventana remota para enviarlo.");
+                        });
 
-                            // Botón Izquierdo
-                            if ui.input(|i| i.pointer.primary_pressed()) {
-                                if let Some(tx) = &self.client_out_tx {
-                                    let _ = tx.send(NetPacket::MouseClick {
-                                        norm_x,
-                                        norm_y,
-                                        button: 0,
-                                        pressed: true,
-                                    });
-                                }
+                    if !self.transferred_files.is_empty() {
+                        ui.add_space(8.0);
+                        ui.collapsing("📁 Historial de Archivos Transferidos", |ui| {
+                            for (name, path, time) in &self.transferred_files {
+                                ui.horizontal(|ui| {
+                                    ui.small(format!("[{}] {}", time, name));
+                                    ui.monospace(path);
+                                });
                             }
-                            if ui.input(|i| i.pointer.primary_released()) {
-                                if let Some(tx) = &self.client_out_tx {
-                                    let _ = tx.send(NetPacket::MouseClick {
-                                        norm_x,
-                                        norm_y,
-                                        button: 0,
-                                        pressed: false,
-                                    });
-                                }
-                            }
-
-                            // Botón Derecho
-                            if ui.input(|i| i.pointer.secondary_pressed()) {
-                                if let Some(tx) = &self.client_out_tx {
-                                    let _ = tx.send(NetPacket::MouseClick {
-                                        norm_x,
-                                        norm_y,
-                                        button: 1,
-                                        pressed: true,
-                                    });
-                                }
-                            }
-                            if ui.input(|i| i.pointer.secondary_released()) {
-                                if let Some(tx) = &self.client_out_tx {
-                                    let _ = tx.send(NetPacket::MouseClick {
-                                        norm_x,
-                                        norm_y,
-                                        button: 1,
-                                        pressed: false,
-                                    });
-                                }
-                            }
-
-                            // Botón Central (Scroll click)
-                            if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle)) {
-                                if let Some(tx) = &self.client_out_tx {
-                                    let _ = tx.send(NetPacket::MouseClick {
-                                        norm_x,
-                                        norm_y,
-                                        button: 2,
-                                        pressed: true,
-                                    });
-                                }
-                            }
-                            if ui.input(|i| i.pointer.button_released(egui::PointerButton::Middle)) {
-                                if let Some(tx) = &self.client_out_tx {
-                                    let _ = tx.send(NetPacket::MouseClick {
-                                        norm_x,
-                                        norm_y,
-                                        button: 2,
-                                        pressed: false,
-                                    });
-                                }
-                            }
-
-                            // Rueda del Mouse (Scroll Wheel)
-                            let scroll_delta_y = ui.input(|i| i.raw_scroll_delta.y);
-                            if scroll_delta_y.abs() > 0.5 {
-                                let delta = if scroll_delta_y > 0.0 { 1 } else { -1 };
-                                if let Some(tx) = &self.client_out_tx {
-                                    let _ = tx.send(NetPacket::MouseWheel { delta_y: delta });
-                                }
-                            }
-
-                            // Teclado: Texto y Teclas de Control
-                            if response.has_focus() || response.hovered() {
-                                for event in ui.input(|i| i.events.clone()) {
-                                    match event {
-                                        egui::Event::Text(text) => {
-                                            if let Some(tx) = &self.client_out_tx {
-                                                let _ = tx.send(NetPacket::TextInput { text });
-                                            }
-                                        }
-                                        egui::Event::Key { key, pressed, .. } => {
-                                            if let Some(vk) = egui_key_to_vk(key) {
-                                                if let Some(tx) = &self.client_out_tx {
-                                                    let _ = tx.send(NetPacket::KeyEvent { vk, pressed });
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
+                        });
                     }
                 } else {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(80.0);
-                        ui.spinner();
-                        ui.label("Recibiendo primer cuadro de video del equipo remoto...");
-                    });
+                    self.render_remote_session_content(ui, false);
                 }
             } else {
                 // Dashboard de Sesiones Recientes / Favoritos estilo AnyDesk
@@ -1478,9 +1754,40 @@ impl eframe::App for AnyRustApp {
                 );
                 ui.label("1. Para probarlo ahora mismo en tu propia PC, haz clic en '⚡ Conectar Ahora' en la fila '127.0.0.1' (con el PIN 1234).");
                 ui.label("2. Para conectarte a otra PC de tu red u oficina, abre AnyRust en ambas computadoras, escribe su ID de 9 dígitos o su IP local y presiona '⚡ Conectar'.");
-                ui.label("3. Incluye transmisión de pantalla comprimida con Zlib sobre TCP, control remoto de Mouse/Clicks y Chat bidireccional.");
+                ui.label("3. Incluye ventana flotante independiente, portapapeles unidireccional y bidireccional, y transferencia de archivos arrastrando y soltando.");
             }
         });
+
+        // Ventana independiente para el Visor Remoto estilo AnyDesk
+        if self.is_connected && self.use_independent_window && self.show_remote_window {
+            let host_title = format!(
+                "🔴 AnyRust - Sesión Remota: {} ({}x{})",
+                self.remote_host_name, self.remote_screen_size.0, self.remote_screen_size.1
+            );
+            let mut close_requested = false;
+
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("anyrust_remote_session_viewport"),
+                egui::ViewportBuilder::default()
+                    .with_title(host_title)
+                    .with_inner_size([1280.0, 750.0])
+                    .with_min_inner_size([640.0, 400.0])
+                    .with_drag_and_drop(true),
+                |ctx, _class| {
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        close_requested = true;
+                    }
+
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        self.render_remote_session_content(ui, true);
+                    });
+                },
+            );
+
+            if close_requested {
+                self.show_remote_window = false;
+            }
+        }
     }
 }
 

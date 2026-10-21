@@ -59,6 +59,15 @@ pub enum NetPacket {
     ClipboardSync {
         text: String,
     },
+    FileTransfer {
+        filename: String,
+        compressed_data: Vec<u8>,
+    },
+    FileReceivedAck {
+        filename: String,
+        saved_path: String,
+        size_bytes: usize,
+    },
     SetQuality {
         scale_div: u32,
     },
@@ -128,6 +137,40 @@ pub fn decompress_bytes(compressed: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).ok()?;
     Some(out)
+}
+
+pub fn get_system_clipboard() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+pub fn set_system_clipboard(text: &str) -> bool {
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        cb.set_text(text).is_ok()
+    } else {
+        false
+    }
+}
+
+pub fn save_transferred_file(filename: &str, data: &[u8]) -> std::io::Result<String> {
+    let base_dir = dirs::download_dir()
+        .or_else(|| dirs::desktop_dir())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let mut target_path = base_dir.join(filename);
+    if target_path.exists() {
+        let stem = target_path.file_stem().and_then(|s| s.to_str()).unwrap_or("archivo");
+        let ext = target_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let timestamp = chrono::Local::now().format("%H%M%S");
+        let new_name = if ext.is_empty() {
+            format!("{}_{}", stem, timestamp)
+        } else {
+            format!("{}_{}.{}", stem, timestamp, ext)
+        };
+        target_path = base_dir.join(new_name);
+    }
+
+    std::fs::write(&target_path, data)?;
+    Ok(target_path.to_string_lossy().to_string())
 }
 
 #[cfg(windows)]
